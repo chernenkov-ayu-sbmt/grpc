@@ -62,6 +62,8 @@ cache.mk
 
 # Ruby's local gem information
 Gemfile.lock
+.ruby-version
+.ruby-gemset
 
 # Temporary test reports
 report.xml

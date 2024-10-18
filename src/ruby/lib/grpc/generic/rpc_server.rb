@@ -33,22 +33,11 @@ module GRPC
       @stop_cond = ConditionVariable.new
       @workers = []
       @keep_alive = keep_alive
-
-      # Each worker thread has its own queue to push and pull jobs
-      # these queues are put into @ready_queues when that worker is idle
-      @ready_workers = Queue.new
     end
 
     # Returns the number of jobs waiting
     def jobs_waiting
       @jobs.size
-    end
-
-    def ready_for_work?
-      # Busy worker threads are either doing work, or have a single job
-      # waiting on them. Workers that are idle with no jobs waiting
-      # have their "queues" in @ready_workers
-      !@ready_workers.empty?
     end
 
     # Runs the given block on the queue with the provided args.
@@ -63,11 +52,7 @@ module GRPC
           return
         end
         GRPC.logger.info('schedule another job')
-        fail 'No worker threads available' if @ready_workers.empty?
-        worker_queue = @ready_workers.pop
-
-        fail 'worker already has a task waiting' unless worker_queue.empty?
-        worker_queue << [blk, args]
+        @jobs << [blk, args]
       end
     end
 
@@ -77,11 +62,9 @@ module GRPC
         fail 'already stopped' if @stopped
       end
       until @workers.size == @size.to_i
-        new_worker_queue = Queue.new
-        @ready_workers << new_worker_queue
-        next_thread = Thread.new(new_worker_queue) do |jobs|
+        next_thread = Thread.new do
           catch(:exit) do  # allows { throw :exit } to kill a thread
-            loop_execute_jobs(jobs)
+            loop_execute_jobs
           end
           remove_current_thread
         end
@@ -94,11 +77,7 @@ module GRPC
       GRPC.logger.info('stopping, will wait for all the workers to exit')
       @stop_mutex.synchronize do  # wait @keep_alive seconds for workers to stop
         @stopped = true
-        loop do
-          break unless ready_for_work?
-          worker_queue = @ready_workers.pop
-          worker_queue << [proc { throw :exit }, []]
-        end
+        @workers.size.times { @jobs << [proc { throw :exit }, []] }
         @stop_cond.wait(@stop_mutex, @keep_alive) if @workers.size > 0
       end
       forcibly_stop_workers
@@ -131,20 +110,14 @@ module GRPC
       end
     end
 
-    def loop_execute_jobs(worker_queue)
+    def loop_execute_jobs
       loop do
         begin
-          blk, args = worker_queue.pop
+          blk, args = @jobs.pop
           blk.call(*args)
         rescue StandardError, GRPC::Core::CallError => e
           GRPC.logger.warn('Error in worker thread')
           GRPC.logger.warn(e)
-        end
-        # there shouldn't be any work given to this thread while its busy
-        fail('received a task while busy') unless worker_queue.empty?
-        @stop_mutex.synchronize do
-          return if @stopped
-          @ready_workers << worker_queue
         end
       end
     end
@@ -159,10 +132,10 @@ module GRPC
 
     def_delegators :@server, :add_http2_port
 
-    # Default thread pool size is 30
-    DEFAULT_POOL_SIZE = 30
+    # Default thread pool size is 3
+    DEFAULT_POOL_SIZE = 3
 
-    # Deprecated due to internal changes to the thread pool
+    # Default max_waiting_requests size is 20
     DEFAULT_MAX_WAITING_REQUESTS = 20
 
     # Default poll period is 1s
@@ -416,8 +389,10 @@ module GRPC
 
     # Sends RESOURCE_EXHAUSTED if there are too many unprocessed jobs
     def available?(an_rpc)
-      return an_rpc if @pool.ready_for_work?
-      GRPC.logger.warn('no free worker threads currently')
+      jobs_count, max = @pool.jobs_waiting, @max_waiting_requests
+      GRPC.logger.info("waiting: #{jobs_count}, max: #{max}")
+      return an_rpc if @pool.jobs_waiting <= @max_waiting_requests
+      GRPC.logger.warn("NOT AVAILABLE: too many jobs_waiting: #{an_rpc}")
       noop = proc { |x| x }
 
       # Create a new active call that knows that metadata hasn't been
